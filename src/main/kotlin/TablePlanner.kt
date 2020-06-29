@@ -1,4 +1,4 @@
-package net.landj.tableplan
+package net.landj.tableplanner
 
 import com.github.ajalt.clikt.core.CliktCommand
 import com.github.ajalt.clikt.parameters.options.default
@@ -6,7 +6,7 @@ import com.github.ajalt.clikt.parameters.options.option
 import com.github.ajalt.clikt.parameters.options.validate
 import com.github.ajalt.clikt.parameters.types.file
 import com.github.ajalt.clikt.parameters.types.int
-import net.landj.tableplan.ParameterStats.Parameter.*
+import net.landj.tableplanner.ParameterStats.Parameter.*
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -18,11 +18,45 @@ const val NO_OF_TABLES = 4
 const val NO_OF_SESSIONS = 4
 const val NO_OF_ITERATIONS = 10000
 const val NO_OF_THREADS = 8
-const val SAME_PERSON_PENALTY = 2.0
-const val PERFECT_PLAN_RATING = SAME_PERSON_PENALTY
+const val BASE_GUEST_RATING = 2.0
 const val FILE_SIZE_LIMIT = 1024
 
 fun Double.format(digits: Int) = "%.${digits}f".format(this)
+
+class ParameterStats(private val parameter: Parameter) {
+    enum class Parameter {
+        Score, Diversity, FollowUps
+    }
+
+    private var _min: Double = 0.0
+    private var _max: Double = 0.0
+    private var _avg: Double = 0.0
+    private var _med: Double = 0.0
+
+    val min: Double
+        get() = _min
+
+    val max: Double
+        get() = _max
+
+    val avg: Double
+        get() = _avg
+
+    val med: Double
+        get() = _med
+
+    fun calculate(values: List<Double>) {
+        val sorted = values.sorted()
+        _min = if (sorted.isNotEmpty()) sorted.first() else 0.0
+        _max = if (sorted.isNotEmpty()) sorted.last() else Double.MAX_VALUE
+        _avg = values.average()
+        _med = if (sorted.isNotEmpty()) sorted[sorted.size / 2] else 0.0
+    }
+
+    override fun toString(): String {
+        return "$parameter: min = ${min.format(2)}, max = ${max.format(2)}, avg = ${avg.format(2)}, med = ${med.format(2)}"
+    }
+}
 
 class Guest(val id: String) {
     private val otherGuests = HashMap<Guest, MutableList<Int>>()
@@ -71,20 +105,24 @@ class Guest(val id: String) {
         tables.add(table)
     }
 
-    fun hasAlreadySetAt(table: Table): Boolean {
-        return tables.contains(table)
+    fun hasNotSatAt(table: Table): Boolean {
+        return !tables.contains(table)
     }
 
     fun getMeetings(other: Guest): Int {
         return otherGuests.getOrDefault(other, emptyList<Guest>()).size
     }
 
-    fun getOtherGuestsSummary(): String {
+    fun getOthersSummary(): String {
         return otherGuests.map { other -> "${other.key.id.padStart(2)} ${other.value}" }.joinToString()
     }
 
+    fun getStats(): String {
+        return "followUps=$followUps, diversity=$diversity, score=${score.format(2)}"
+    }
+
     override fun toString(): String {
-        return "${id.padStart(2)} (followUps=$followUps, diversity=$diversity, score=${score.format(2)})"
+        return id
     }
 
     override fun equals(other: Any?): Boolean {
@@ -108,10 +146,7 @@ class Guest(val id: String) {
         }
 
         fun calculateScore(guest: Guest, others: Collection<Guest>): Double {
-            return others.sumByDouble { other ->
-                val meetings = other.getMeetings(guest).toDouble()
-                return SAME_PERSON_PENALTY.pow(meetings)
-            }
+            return others.sumByDouble { other -> BASE_GUEST_RATING.pow(other.getMeetings(guest)) } / guest.diversity
         }
     }
 }
@@ -164,6 +199,45 @@ class Table(val id: String) {
     }
 }
 
+class Usher(private val guests: List<Guest>,
+            private val tables: List<Table>,
+            private val nextTableAllocator: NextTableAllocator) {
+    private var round = 0
+
+    fun firstRound() {
+        round = 1
+        for (i in guests.indices) {
+            tables[i % tables.size].seatAGuest(guests[i], round)
+        }
+    }
+
+    fun nextRound() {
+        round++
+
+        val remaining = guests.toMutableList()
+
+        while (remaining.isNotEmpty()) {
+            val guest = remaining.removeAt(0)
+            nextTableAllocator.nextTable(guest, tables, round).seatAGuest(guest, round)
+        }
+    }
+
+    fun printSeating() {
+        println("By Table")
+        for (i in 1..round) {
+            println("\tRound: $i")
+            for (table in tables) {
+                println("\t\tTable $table - ${table.getSeatingInRound(i)}")
+            }
+        }
+        println("By Guest")
+        for (guest in guests) {
+            println("\tGuest: ${guest.toString().padStart(2)} (${guest.getStats()}) - tables ${guest.tables} - ${guest.getOthersSummary()}")
+        }
+
+    }
+}
+
 interface NextTableAllocator {
     fun nextTable(guest: Guest, tables: List<Table>, round: Int): Table
 }
@@ -171,7 +245,7 @@ interface NextTableAllocator {
 class LookAheadTableAllocator : NextTableAllocator {
     override fun nextTable(guest: Guest, tables: List<Table>, round: Int): Table {
         val tablesBySuitability = tables
-                .filter { table -> !guest.hasAlreadySetAt(table) }
+                .filter { table -> guest.hasNotSatAt(table) }
                 .map { table -> Pair(scoreWithGuestInRound(table, guest, round), table) }
                 .sortedBy { entry -> entry.first }
         return tablesBySuitability.filter { entry -> entry.first == tablesBySuitability[0].first }.random().second
@@ -186,22 +260,14 @@ class LookAheadTableAllocator : NextTableAllocator {
 @Suppress("unused")
 class RandomTableAllocator : NextTableAllocator {
     override fun nextTable(guest: Guest, tables: List<Table>, round: Int): Table {
-        return tables.filter { table -> !guest.hasAlreadySetAt(table) }.random()
-    }
-}
-
-@Suppress("unused")
-class LeastGuestsTableAllocator : NextTableAllocator {
-    override fun nextTable(guest: Guest, tables: List<Table>, round: Int): Table {
-        val suitableTables = tables.filter { table -> !guest.hasAlreadySetAt(table) }
-        return suitableTables.minBy { table -> table.getNoOfGuestsAtTable(round) } ?: suitableTables.first()
+        return tables.filter { table -> guest.hasNotSatAt(table) }.random()
     }
 }
 
 class LeastGuestsRandomTableAllocator : NextTableAllocator {
     override fun nextTable(guest: Guest, tables: List<Table>, round: Int): Table {
         val tablesBySuitability = tables
-                .filter { table -> !guest.hasAlreadySetAt(table) }
+                .filter { table -> guest.hasNotSatAt(table) }
                 .map { table -> Pair(table.getNoOfGuestsAtTable(round), table) }
                 .sortedBy { entry -> entry.first }
 
@@ -209,98 +275,21 @@ class LeastGuestsRandomTableAllocator : NextTableAllocator {
     }
 }
 
-class Usher(private val guests: List<Guest>, private val tables: List<Table>, private val nextTableAllocator: NextTableAllocator) {
-    private var round = 0
-    private var seatedInCurrentRound = ArrayList<Guest>()
-
-    fun firstRound() {
-        round = 1
-        for (i in guests.indices) {
-            tables[i % tables.size].seatAGuest(guests[i], round)
-        }
-    }
-
-    fun nextRound() {
-        round++
-        seatedInCurrentRound.clear()
-
-        val remaining = guests.toMutableList()
-
-        while (remaining.isNotEmpty()) {
-            val guest = remaining.first()
-
-            nextTableAllocator.nextTable(guest, tables, round).seatAGuest(guest, round)
-
-            remaining.remove(guest)
-            seatedInCurrentRound.add(guest)
-        }
-    }
-
-    fun printSeating() {
-        println("By Table")
-        for (i in 1..round) {
-            println("\tRound: $i")
-            for (table in tables) {
-                println("\t\tTable $table - ${table.getSeatingInRound(i)}")
-            }
-        }
-        println("By Guest")
-        for (guest in guests) {
-            println("\tGuest: $guest - tables ${guest.tables} - ${guest.getOtherGuestsSummary()}")
-        }
-
-    }
-}
-
-class ParameterStats(private val parameter: Parameter) {
-    enum class Parameter {
-        Score, Diversity, FollowUps
-    }
-
-    private var _min: Double = 0.0
-    private var _max: Double = 0.0
-    private var _avg: Double = 0.0
-    private var _med: Double = 0.0
-
-    val min: Double
-        get() = _min
-
-    val max: Double
-        get() = _max
-    val avg: Double
-        get() = _avg
-
-    val med: Double
-        get() = _med
-
-    fun calculate(values: List<Double>) {
-        _min = values.min() ?: 0.0
-        _max = values.max() ?: Double.MAX_VALUE
-        _avg = values.average()
-        _med = if (values.isNotEmpty()) values[values.size / 2] else 0.0
-    }
-
-    override fun toString(): String {
-        return "$parameter: min = ${min.format(2)}, max = ${max.format(2)}, avg = ${avg.format(2)}, med = ${med.format(2)}"
-    }
-}
-
 @Suppress("MemberVisibilityCanBePrivate")
 class TablePlan(
         private val guests: List<Guest>,
         private val tables: List<Table>,
-        private val noOfSessions: Int
+        private val noOfSessions: Int,
+        nextTableAllocator: NextTableAllocator
 ) : Runnable {
     private val guestScores = ParameterStats(Score)
     val followUps = ParameterStats(FollowUps)
     private val diversities = ParameterStats(Diversity)
 
-    private val nextTableAllocator = if (guests.size <= tables.size * (noOfSessions - 1)) LookAheadTableAllocator() else LeastGuestsRandomTableAllocator()
-
     private val usher = Usher(guests, tables, nextTableAllocator)
 
     val tableScore: Double
-        get() = 1.0 + tables.map { table -> abs(table.totalGuestsAtTable.toDouble().div(noOfSessions) - guests.size.toDouble().div(tables.size)) }.sum()
+        get() = 1.0 + tables.sumByDouble { table -> abs(table.totalGuestsAtTable.toDouble().div(noOfSessions) - guests.size.toDouble().div(tables.size)) }
 
     val followUpsScore: Double
         get() = max(followUps.max + (followUps.med - followUps.avg).absoluteValue, 1.0)
@@ -363,7 +352,8 @@ class TablePlan(
 
 class PlanFactory(val noOfSessions: Int,
                   private val tableNames: List<String>,
-                  private val guestNames: List<String>) {
+                  private val guestNames: List<String>,
+                  private var _nextTableAllocator: NextTableAllocator? = null) {
 
     val noOfTables: Int
         get() = tableNames.size
@@ -371,14 +361,29 @@ class PlanFactory(val noOfSessions: Int,
     val noOfGuests: Int
         get() = guestNames.size
 
+    val idealSeatingThreshold: Int
+        get() = noOfTables * (noOfSessions - 1)
+
+    private val nextTableAllocator: NextTableAllocator
+        get() {
+            if (_nextTableAllocator == null) {
+                _nextTableAllocator = if (noOfGuests <= idealSeatingThreshold) LookAheadTableAllocator() else LeastGuestsRandomTableAllocator()
+            }
+            return _nextTableAllocator as NextTableAllocator
+        }
+
     fun newPlan(): TablePlan {
-        return TablePlan(guestNames.map { name -> Guest(name) }, tableNames.map { name -> Table(name) }, noOfSessions)
+        return TablePlan(
+                guestNames.map { name -> Guest(name) },
+                tableNames.map { name -> Table(name) },
+                noOfSessions,
+                nextTableAllocator)
     }
 }
 
-class TablePlaner : CliktCommand() {
+class TablePlanner : CliktCommand(help = "tableplanner v1.0-kt") {
     private val noOfTablesOption: Int by option("-t", "--tables", help = "Number of tables").int().default(NO_OF_TABLES)
-            .validate { require(it in 3..5) { "between 3 and 5 sessions are supported" } }
+            .validate { require(it in 3..5) { "between 3 and 5 tables are supported" } }
     private val noOfSessionsOption: Int by option("-s", "--sessions", help = "Number of sessions").int().default(NO_OF_SESSIONS)
             .validate { require(it in 2..5) { "between 2 and 5 sessions are supported" } }
     private val noOfGuestsOption: Int by option("-g", "--guests", help = "Number of people (minus hosts). Ignored if list of names is provided!").int().default(NO_OF_GUESTS)
@@ -386,7 +391,7 @@ class TablePlaner : CliktCommand() {
     private val namesFileOption: File? by option("-i", "--input", help = "Path to a files with list of names to seat").file()
             .validate { require(it.exists() && it.isFile && it.canRead() && it.length() < FILE_SIZE_LIMIT) { "Input file must exist and be readable with each file name on a separate line" } }
     private val csvFileOption: File? by option("-o", "--output", help = "Output file (CSV)").file()
-    private val noOfIterationsOption: Int by option("-it", "--iterations", help = "Number of calculation runs").int().default(NO_OF_ITERATIONS)
+    private val noOfIterationsOption: Int by option("-it", "--iterations", help = "Number of possible runs").int().default(NO_OF_ITERATIONS)
             .validate { require(it in 100..1000000) { "iterations between 100 and 1,000,000 are expected" } }
     private val noOfThreadsOption: Int by option("-th", "--threads", help = "Number of calculation threads").int().default(NO_OF_THREADS)
             .validate { require(it in 2..16) { "2 threads minimum are required" } }
@@ -459,6 +464,7 @@ class TablePlaner : CliktCommand() {
 
         val maxFollowUps = determineMaxFollowUps()
         val ignoreTableScore = noOfTablesOption - noOfSessionsOption >= 1
+        val perfectRating = determinePerfectRating()
 
         println("max follow ups = $maxFollowUps, ignore table score = $ignoreTableScore")
 
@@ -466,7 +472,7 @@ class TablePlaner : CliktCommand() {
             val plan = resultQueue.take()
             processedResults++
 
-            if (plan.rating == PERFECT_PLAN_RATING) {
+            if (plan.rating == perfectRating) {
                 solutionFound = true
                 return plan
             } else if (plan.followUps.max <= maxFollowUps && (ignoreTableScore || plan.tableScore == 1.0)) {
@@ -483,6 +489,10 @@ class TablePlaner : CliktCommand() {
             println("What?")
             allPlans.minBy { p -> p.rating }
         }
+    }
+
+    private fun determinePerfectRating(): Double {
+        return if (planFactory.noOfGuests == planFactory.idealSeatingThreshold) BASE_GUEST_RATING else BASE_GUEST_RATING * 2
     }
 
     inner class PlansGenerator : Runnable {
@@ -503,5 +513,5 @@ class TablePlaner : CliktCommand() {
 }
 
 fun main(args: Array<String>) {
-    TablePlaner().main(args)
+    TablePlanner().main(args)
 }
